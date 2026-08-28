@@ -42,6 +42,7 @@ class FrankyHwEnv:
         self.obstacle_center = np.array(obstacle_center)
         self.obstacle_radius = obstacle_radius
         self.faulted = False
+        self.franka_model = franka_model  # optional FrankaModel instance, for accurate ee_position()
 
         try:
             self.robot = franky.Robot(
@@ -116,9 +117,15 @@ class FrankyHwEnv:
         return np.concatenate([q, qdot])
 
     def ee_position(self, ee_body_name: str = "hand") -> np.ndarray:
-        """NOTE: ee_body_name is accepted for interface parity with
-        MujocoFrankaEnv but ignored here -- franky gives the real robot's
-        Cartesian pose directly (no MJCF body names on hardware)."""
+    """Returns the gripper-tip position via FK (matching sim's convention),
+    NOT franky's raw current_pose (which reports the flange, not the
+    mounted gripper's tip -- confirmed ~0.107m offset via direct testing)."""
+        if self.franka_model is not None:
+            q = self.get_state()[:7]
+            centers, _ = self.franka_model.fk(q)
+            return centers[-1]
+        # Fallback if no franka_model was provided -- flange position,
+        # documented as NOT the true gripper-tip position.
         pose = self._safe_call(lambda: self.robot.current_pose)
         return np.asarray(pose.end_effector_pose.translation, dtype=np.float64)
 
