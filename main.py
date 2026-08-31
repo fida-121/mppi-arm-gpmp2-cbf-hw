@@ -278,6 +278,8 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
                 env.step(qp_result.u_safe)
             except RuntimeError as e:
                 print(f"HARDWARE FAULT — stopping loop: {e}")
+                if use_hardware:
+                    env.stop()
                 return history, feas_log, cov_steer
             _emit("Robot Execution", q=q, qdot=qdot, u_safe=qp_result.u_safe,
                   ee_position=env.ee_position(), t=global_t, cycle=cycle, k=k)
@@ -414,6 +416,8 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
     # the trajectory the accept/rollback guard would return to anyway.
     history["best_goal_error"] = best_goal_err
     history["best_theta_star"] = best_theta_star
+    if use_hardware:
+        env.stop()
 
     return history, feas_log, cov_steer
 
