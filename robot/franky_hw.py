@@ -12,25 +12,34 @@ MOTION TYPES USED (IMPORTANT, read before modifying):
   step()  -> franky.JointImpedanceTrackingMotion + set_reference().
              A torque-based spring-damper controller with NO built-in
              trajectory planning -- it applies torque proportional to
-             (reference - actual) EVERY cycle, immediately. This is
-             fast/smooth for SMALL incremental reference changes (which
-             is what the CBF-QP loop produces cycle-to-cycle), but is
-             DANGEROUS for large jumps: a big instantaneous reference
-             error produces a correspondingly large, fast, forceful
-             correction. CONFIRMED BY DIRECT HARDWARE TESTING: an
-             earlier version of this file called set_reference()
-             directly inside reset() with a far-away target, and the
-             robot moved "very rapidly with very high force and
-             torque" -- a real safety incident, not a theoretical
-             concern.
+             (reference - actual) EVERY cycle, immediately. CONFIRMED BY
+             DIRECT HARDWARE TESTING: an earlier version of this file
+             called set_reference() directly inside reset() with a
+             far-away target, and the robot moved "very rapidly with
+             very high force and torque" -- a real safety incident.
 
   THE RULE THIS FILE ENFORCES: reset() always uses the Ruckig-planned,
-  distance-safe JointMotion. The JointImpedanceTrackingMotion used by
-  step() is only ever started AFTER reset() has already placed the arm
-  at the target pose -- so its first reference is always a zero (or
-  near-zero) distance from the arm's actual position. NEVER call
-  set_reference() with a target that could be far from the robot's
-  current actual position.
+  distance-safe JointMotion. JointImpedanceTrackingMotion is only ever
+  started AFTER reset() has already placed the arm at the target pose.
+
+STEP-SIZE SAFETY (velocity-based, not a flat threshold):
+  A first version of this file used a single flat max_step_delta (e.g.
+  0.05, then 0.1 rad) and REFUSED any step() call exceeding it. This
+  was found to be too blunt in practice: GPMP2/MPPI's trajectory
+  naturally needs LARGER position deltas per control_dt while
+  accelerating from rest (e.g. right after reset()), then stabilizes --
+  a real, expected pattern, not a danger signal. A flat refuse-outright
+  guard kept faulting on legitimate early-cycle acceleration.
+
+  This version instead SOFT-CLAMPS each requested step to Franka's real
+  per-joint velocity limits (approximate official values below) scaled
+  by control_dt -- i.e. it lets the robot move as fast as it physically
+  safely can, but never faster, rather than erroring out on a
+  legitimate-but-large request. A HARD fault is still raised only for
+  requests that are wildly larger than even the physical velocity
+  ceiling (hard_fault_multiplier x the per-joint velocity-derived
+  limit), since that indicates a genuine bug (e.g. a bad CBF-QP
+  solution, wrong units, stale state) rather than normal acceleration.
 
 SAFETY: every franky call that talks to the robot is wrapped; any
 exception sets self.faulted=True and re-raises, so the calling loop
@@ -43,6 +52,12 @@ import franky
 
 from robot.franka import DOF, Q_MIN, Q_MAX  # reuse existing joint limits
 
+# Approximate official Franka Panda joint velocity limits [rad/s].
+# Joints 1-4 (base-side) are slower than joints 5-7 (wrist-side).
+# These are conservative published figures -- if you have exact values
+# from Franka's own documentation for your firmware, prefer those.
+FRANKA_MAX_JOINT_VEL = np.array([2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61])
+
 
 class FrankyHwEnv:
     def __init__(self, robot_ip: str = "172.16.0.2",
@@ -50,31 +65,35 @@ class FrankyHwEnv:
                  dynamics_factor: float = 0.1,   # scalar in (0, 1] -- START LOW.
                  obstacle_center=(0.5, 0.0, 0.4), obstacle_radius=0.08,
                  stiffness: np.ndarray = None, damping: np.ndarray = None,
-                 max_step_delta: float = 0.05):
+                 velocity_safety_factor: float = 0.5,
+                 hard_fault_multiplier: float = 2.0):
         """
         stiffness/damping: (7,) arrays for the joint impedance controller
         used by step(). If None, franky's own defaults are used.
-        max_step_delta: SAFETY LIMIT (rad). step() will raise rather than
-        silently execute if u_star differs from the robot's current
-        actual position by more than this, on ANY joint. This is a
-        defense-in-depth guard against ever feeding
-        JointImpedanceTrackingMotion a large jump (see module docstring
-        for why that's dangerous) -- e.g. from a bad CBF-QP solution, a
-        bug elsewhere in the pipeline, or a stale/wrong q0. Tune this
-        down further once you've observed real cycle-to-cycle step
-        sizes from the CBF-QP in practice.
+
+        velocity_safety_factor: fraction (0,1] of FRANKA_MAX_JOINT_VEL
+        that step() is allowed to use, per joint, before soft-clamping.
+        0.5 (default) means step() will clamp requested deltas to at
+        most half the robot's rated max joint velocity -- conservative,
+        raise gradually once you've observed real behavior at this
+        setting.
+
+        hard_fault_multiplier: if a requested delta exceeds
+        velocity_safety_factor * FRANKA_MAX_JOINT_VEL by MORE than this
+        multiplier, step() raises RuntimeError instead of clamping --
+        this catches genuinely anomalous requests (bugs, bad solves),
+        not normal acceleration.
         """
         self.control_dt = control_dt
         self.obstacle_center = np.array(obstacle_center)
         self.obstacle_radius = obstacle_radius
         self.faulted = False
         self.franka_model = None  # set externally by build_default_system()
-        self._tracking_motion = None  # the persistent JointImpedanceTrackingMotion
-        # used by step(); only started inside reset(), after the arm is
-        # already at the reset target -- see module docstring.
+        self._tracking_motion = None
         self._stiffness = stiffness
         self._damping = damping
-        self._max_step_delta = max_step_delta
+        self._max_delta = velocity_safety_factor * FRANKA_MAX_JOINT_VEL * control_dt
+        self._hard_fault_delta = self._max_delta * hard_fault_multiplier
 
         try:
             self.robot = franky.Robot(
@@ -89,26 +108,14 @@ class FrankyHwEnv:
     def reset(self, q0: np.ndarray, qdot0: np.ndarray = None):
         """
         Moves to q0 using a Ruckig-planned, jerk-limited JointMotion --
-        SAFE for any distance, since it respects relative_dynamics_factor
-        regardless of how far q0 is from the current position (unlike
-        step()'s JointImpedanceTrackingMotion -- see module docstring).
-        Blocks until arrival (JointMotion's own return_when_finished
-        default, no polling loop needed here).
-
-        After arrival, starts (or restarts) the JointImpedanceTrackingMotion
-        used by step(), with its FIRST reference set to q0 -- i.e. the
-        arm's actual current position -- so there is never a jump when
-        step()-based tracking begins.
-
-        qdot0 is accepted for interface parity with MujocoFrankaEnv but
-        ignored (matches previous version's behavior).
+        SAFE for any distance. Blocks until arrival. After arrival,
+        starts the JointImpedanceTrackingMotion used by step(), with its
+        FIRST reference set to q0 (the arm's actual current position),
+        so there is never a jump when step()-based tracking begins.
+        qdot0 accepted for interface parity but ignored.
         """
         q0 = np.asarray(q0, dtype=np.float64)
 
-        # Stop any previously-running tracking motion before the Ruckig
-        # move -- franky requires the control signal type not to change
-        # mid-motion; stopping first avoids any ambiguity about which
-        # controller is active.
         if self._tracking_motion is not None:
             try:
                 self.robot.stop()
@@ -119,9 +126,6 @@ class FrankyHwEnv:
         motion = franky.JointMotion(target=franky.JointState(position=q0))
         self._safe_call(self.robot.move, motion)  # blocking, Ruckig-planned
 
-        # Now start the tracking controller used by step(), with its
-        # first reference equal to where the arm actually is -- zero
-        # distance, so no jump.
         self._tracking_motion = franky.JointImpedanceTrackingMotion(
             stiffness=self._stiffness, damping=self._damping,
         )
@@ -133,36 +137,44 @@ class FrankyHwEnv:
         u_star: (7,) desired joint POSITION, post CBF-QP filtering --
         same convention as MujocoFrankaEnv.step().
 
-        Publishes u_star as the new reference for the already-running
-        JointImpedanceTrackingMotion (started by reset()). Raises if
-        u_star is more than max_step_delta away from the robot's CURRENT
-        actual position on any joint -- see __init__ docstring and the
-        module-level docstring for why large jumps through this
-        controller are dangerous.
+        Requested deltas beyond the velocity-derived soft limit
+        (self._max_delta) are CLAMPED per-joint to that limit, not
+        refused -- lets the robot move as fast as it safely can even
+        during legitimate acceleration from rest. Only deltas beyond
+        self._hard_fault_delta (a much larger, genuinely-anomalous
+        threshold) cause a hard fault.
         """
         if self._tracking_motion is None:
             raise RuntimeError(
-                "step() called before reset() -- the tracking motion was "
-                "never started. Call reset(q0) first (this also protects "
-                "against feeding a large, unplanned jump into the torque "
-                "controller).")
+                "step() called before reset() -- call reset(q0) first.")
 
         t0 = time.monotonic()
         u_star = np.clip(np.asarray(u_star, dtype=np.float64), Q_MIN, Q_MAX)
 
         q_now = self.get_state()[:7]
-        delta = np.abs(u_star - q_now)
-        if np.any(delta > self._max_step_delta):
+        delta = u_star - q_now
+        abs_delta = np.abs(delta)
+
+        if np.any(abs_delta > self._hard_fault_delta):
             self.faulted = True
             raise RuntimeError(
                 f"step(): u_star differs from current position by up to "
-                f"{delta.max():.4f} rad (limit {self._max_step_delta}) -- "
-                f"REFUSING to send this to the torque-based tracking "
-                f"controller (see module docstring: large jumps through "
-                f"JointImpedanceTrackingMotion cause fast, forceful "
-                f"motion). u_star={u_star}, q_now={q_now}")
+                f"{abs_delta.max():.4f} rad, exceeding the HARD fault "
+                f"threshold ({self._hard_fault_delta.max():.4f} rad) -- "
+                f"this is well beyond normal acceleration and likely "
+                f"indicates a bug (bad CBF-QP solution, stale state, "
+                f"wrong units, etc). REFUSING. u_star={u_star}, "
+                f"q_now={q_now}")
 
-        self._safe_call(self._tracking_motion.set_reference, franky.JointReference(q=u_star))
+        # Soft-clamp any joint exceeding the velocity-derived limit --
+        # move as fast as safely possible instead of refusing outright.
+        over_limit = abs_delta > self._max_delta
+        if np.any(over_limit):
+            direction = np.sign(delta)
+            u_star = np.where(over_limit, q_now + direction * self._max_delta, u_star)
+
+        target = franky.JointReference(q=u_star)
+        self._safe_call(self._tracking_motion.set_reference, target)
 
         elapsed = time.monotonic() - t0
         remaining = self.control_dt - elapsed
@@ -182,10 +194,7 @@ class FrankyHwEnv:
     def ee_position(self, ee_body_name: str = "hand") -> np.ndarray:
         """Returns the gripper-tip position via FK (matching sim's convention),
         NOT franky's raw current_pose (which reports the flange, not the
-        mounted gripper's tip -- confirmed ~0.107m offset via direct testing).
-        Requires self.franka_model to be set externally (see
-        build_default_system() in main.py); falls back to the raw flange
-        pose (documented as inaccurate) if it hasn't been wired in."""
+        mounted gripper's tip -- confirmed ~0.107m offset via direct testing)."""
         if self.franka_model is not None:
             q = self.get_state()[:7]
             centers, _ = self.franka_model.fk(q)
@@ -195,7 +204,7 @@ class FrankyHwEnv:
 
     def stop(self):
         """Explicitly stop the tracking motion. Safe to call even if no
-        motion was ever started (e.g. reset() was never called)."""
+        motion was ever started."""
         if self._tracking_motion is not None:
             try:
                 self.robot.stop()
