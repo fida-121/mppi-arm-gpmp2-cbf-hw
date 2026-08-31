@@ -49,7 +49,8 @@ def build_default_system(mjcf_path: str, obstacle_center=(0.5, 0.0, 0.4),
     if use_hardware:
         from robot.franky_hw import FrankyHwEnv
         env = FrankyHwEnv(robot_ip=robot_ip, dynamics_factor=0.05,
-                           obstacle_center=obstacle_center, obstacle_radius=obstacle_radius)
+                           obstacle_center=obstacle_center, obstacle_radius=obstacle_radius,
+                           max_step_delta=0.1)
     else:
         env = MujocoFrankaEnv(mjcf_path=mjcf_path, obstacle_center=obstacle_center,
                                obstacle_radius=obstacle_radius)
