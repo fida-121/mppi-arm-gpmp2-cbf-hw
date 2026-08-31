@@ -111,7 +111,10 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
         obstacle_radius=obstacle_radius, d_safe=d_safe,
         use_hardware=use_hardware, robot_ip=robot_ip)
 
-    q0 = np.zeros(DOF)
+    q0 = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])  # Franka's
+    # standard "ready" home pose -- verified safe on this robot via
+    # stage_2c_joint.py (Stage 2c multi-waypoint test), not the
+    # arbitrary all-zeros configuration.
     q_goal = np.array([0.4, -0.3, 0.2, -1.8, 0.1, 1.6, 0.5])
     theta0 = np.concatenate([q0, np.zeros(DOF)])
     theta_goal = np.concatenate([q_goal, np.zeros(DOF)])
