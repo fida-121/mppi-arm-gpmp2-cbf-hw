@@ -5,24 +5,32 @@ Real-hardware drop-in replacement for MujocoFrankaEnv, backed by franky
 (-> libfranka 0.9.2) instead of MuJoCo. Same interface as
 robot/mujoco_env.py: reset(), step(), get_state(), ee_position().
 
-CONTROL MODE / MOTION TYPE: joint position, streamed via
-franky.JointImpedanceTrackingMotion + set_reference() each step() call.
+MOTION TYPES USED (IMPORTANT, read before modifying):
+  reset() -> franky.JointMotion (Ruckig-planned, velocity/accel/jerk-
+             limited, respects relative_dynamics_factor regardless of
+             distance). SAFE for large/arbitrary jumps between poses.
+  step()  -> franky.JointImpedanceTrackingMotion + set_reference().
+             A torque-based spring-damper controller with NO built-in
+             trajectory planning -- it applies torque proportional to
+             (reference - actual) EVERY cycle, immediately. This is
+             fast/smooth for SMALL incremental reference changes (which
+             is what the CBF-QP loop produces cycle-to-cycle), but is
+             DANGEROUS for large jumps: a big instantaneous reference
+             error produces a correspondingly large, fast, forceful
+             correction. CONFIRMED BY DIRECT HARDWARE TESTING: an
+             earlier version of this file called set_reference()
+             directly inside reset() with a far-away target, and the
+             robot moved "very rapidly with very high force and
+             torque" -- a real safety incident, not a theoretical
+             concern.
 
-WHY NOT JointWaypointMotion (previous version of this file): sending a
-NEW JointWaypointMotion every control_dt, each targeting a ZERO-velocity
-waypoint, causes visible stop-start/stutter motion -- confirmed by
-direct hardware testing. Each waypoint is planned by Ruckig as a
-decelerate-to-rest segment; replanning one every ~50ms means the robot
-is repeatedly told to brake, then immediately re-accelerate toward a
-new nearby target. JointImpedanceTrackingMotion instead starts ONE
-torque-based impedance controller that runs continuously and simply
-reads the latest reference each control cycle via set_reference() --
-much closer to MuJoCo's continuous position-servo actuators in sim,
-which is the behavior we're trying to match.
-
-Every franky API call below was verified against `help()` output from
-the actual installed franky build in the franky-hw Docker image (not
-guessed from docs).
+  THE RULE THIS FILE ENFORCES: reset() always uses the Ruckig-planned,
+  distance-safe JointMotion. The JointImpedanceTrackingMotion used by
+  step() is only ever started AFTER reset() has already placed the arm
+  at the target pose -- so its first reference is always a zero (or
+  near-zero) distance from the arm's actual position. NEVER call
+  set_reference() with a target that could be far from the robot's
+  current actual position.
 
 SAFETY: every franky call that talks to the robot is wrapped; any
 exception sets self.faulted=True and re-raises, so the calling loop
@@ -41,24 +49,32 @@ class FrankyHwEnv:
                  control_dt: float = 0.05,
                  dynamics_factor: float = 0.1,   # scalar in (0, 1] -- START LOW.
                  obstacle_center=(0.5, 0.0, 0.4), obstacle_radius=0.08,
-                 stiffness: np.ndarray = None, damping: np.ndarray = None):
+                 stiffness: np.ndarray = None, damping: np.ndarray = None,
+                 max_step_delta: float = 0.05):
         """
-        stiffness/damping: (7,) arrays for the joint impedance controller.
-        If None, franky's own defaults are used (unverified what those
-        are -- START by testing with defaults, and only override if the
-        default behavior feels too stiff/soft once you can observe real
-        motion quality).
+        stiffness/damping: (7,) arrays for the joint impedance controller
+        used by step(). If None, franky's own defaults are used.
+        max_step_delta: SAFETY LIMIT (rad). step() will raise rather than
+        silently execute if u_star differs from the robot's current
+        actual position by more than this, on ANY joint. This is a
+        defense-in-depth guard against ever feeding
+        JointImpedanceTrackingMotion a large jump (see module docstring
+        for why that's dangerous) -- e.g. from a bad CBF-QP solution, a
+        bug elsewhere in the pipeline, or a stale/wrong q0. Tune this
+        down further once you've observed real cycle-to-cycle step
+        sizes from the CBF-QP in practice.
         """
         self.control_dt = control_dt
         self.obstacle_center = np.array(obstacle_center)
         self.obstacle_radius = obstacle_radius
         self.faulted = False
         self.franka_model = None  # set externally by build_default_system()
-        self._motion = None  # the persistent JointImpedanceTrackingMotion,
-        # created lazily on the first reset()/step() call once we know
-        # the robot connected successfully.
+        self._tracking_motion = None  # the persistent JointImpedanceTrackingMotion
+        # used by step(); only started inside reset(), after the arm is
+        # already at the reset target -- see module docstring.
         self._stiffness = stiffness
         self._damping = damping
+        self._max_step_delta = max_step_delta
 
         try:
             self.robot = franky.Robot(
@@ -70,69 +86,83 @@ class FrankyHwEnv:
             self.faulted = True
             raise RuntimeError(f"Failed to connect to robot at {robot_ip}: {e}")
 
-    def _ensure_motion_started(self, q_initial: np.ndarray):
-        """Starts the persistent JointImpedanceTrackingMotion if it isn't
-        already running. Called internally by reset()/step() -- not
-        meant to be called directly."""
-        if self._motion is not None:
-            return
-        self._motion = franky.JointImpedanceTrackingMotion(
+    def reset(self, q0: np.ndarray, qdot0: np.ndarray = None):
+        """
+        Moves to q0 using a Ruckig-planned, jerk-limited JointMotion --
+        SAFE for any distance, since it respects relative_dynamics_factor
+        regardless of how far q0 is from the current position (unlike
+        step()'s JointImpedanceTrackingMotion -- see module docstring).
+        Blocks until arrival (JointMotion's own return_when_finished
+        default, no polling loop needed here).
+
+        After arrival, starts (or restarts) the JointImpedanceTrackingMotion
+        used by step(), with its FIRST reference set to q0 -- i.e. the
+        arm's actual current position -- so there is never a jump when
+        step()-based tracking begins.
+
+        qdot0 is accepted for interface parity with MujocoFrankaEnv but
+        ignored (matches previous version's behavior).
+        """
+        q0 = np.asarray(q0, dtype=np.float64)
+
+        # Stop any previously-running tracking motion before the Ruckig
+        # move -- franky requires the control signal type not to change
+        # mid-motion; stopping first avoids any ambiguity about which
+        # controller is active.
+        if self._tracking_motion is not None:
+            try:
+                self.robot.stop()
+            except Exception:
+                pass
+            self._tracking_motion = None
+
+        motion = franky.JointMotion(target=franky.JointState(position=q0))
+        self._safe_call(self.robot.move, motion)  # blocking, Ruckig-planned
+
+        # Now start the tracking controller used by step(), with its
+        # first reference equal to where the arm actually is -- zero
+        # distance, so no jump.
+        self._tracking_motion = franky.JointImpedanceTrackingMotion(
             stiffness=self._stiffness, damping=self._damping,
         )
-        self._safe_call(self.robot.move, self._motion, asynchronous=True)
-        # Publish an initial reference immediately so the controller has
-        # something valid to track from the first control cycle --
-        # get_reference() can return None before any reference is set.
-        self._motion.set_reference(franky.JointReference(q=q_initial))
-
-    def reset(self, q0: np.ndarray, qdot0: np.ndarray = None):
-        """Moves to q0. Unlike the old JointWaypointMotion version, this
-        does NOT block until arrival -- it starts (or reuses) the
-        persistent tracking motion and sets q0 as the reference, then
-        waits (polling get_state()) until the arm is close enough to q0
-        before returning, so callers can still treat this as an
-        effectively-blocking call like MujocoFrankaEnv.reset() is.
-        qdot0 is accepted for interface parity but ignored (matches
-        previous version's behavior)."""
-        q0 = np.asarray(q0, dtype=np.float64)
-        self._ensure_motion_started(q0)
-        self._safe_call(self._motion.set_reference, franky.JointReference(q=q0))
-
-        # Poll until close to target or timeout -- avoids returning
-        # control to the caller while the arm is still mid-motion to q0.
-        timeout_s = 10.0
-        poll_dt = 0.05
-        tol = 0.02  # rad, per-joint
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout_s:
-            q_now = self.get_state()[:7]
-            if np.all(np.abs(q_now - q0) < tol):
-                return
-            time.sleep(poll_dt)
-        raise RuntimeError(f"reset(): timed out waiting to reach q0={q0}, "
-                            f"last q={self.get_state()[:7]}")
+        self._safe_call(self.robot.move, self._tracking_motion, asynchronous=True)
+        self._safe_call(self._tracking_motion.set_reference, franky.JointReference(q=q0))
 
     def step(self, u_star: np.ndarray):
         """
         u_star: (7,) desired joint POSITION, post CBF-QP filtering --
         same convention as MujocoFrankaEnv.step().
 
-        Publishes u_star as the new reference for the ALREADY-RUNNING
-        JointImpedanceTrackingMotion -- no new motion object, no
-        replanning, no forced deceleration each cycle. This is the fix
-        for the stop-start stutter seen with the previous
-        JointWaypointMotion-per-cycle approach.
+        Publishes u_star as the new reference for the already-running
+        JointImpedanceTrackingMotion (started by reset()). Raises if
+        u_star is more than max_step_delta away from the robot's CURRENT
+        actual position on any joint -- see __init__ docstring and the
+        module-level docstring for why large jumps through this
+        controller are dangerous.
         """
+        if self._tracking_motion is None:
+            raise RuntimeError(
+                "step() called before reset() -- the tracking motion was "
+                "never started. Call reset(q0) first (this also protects "
+                "against feeding a large, unplanned jump into the torque "
+                "controller).")
+
         t0 = time.monotonic()
         u_star = np.clip(np.asarray(u_star, dtype=np.float64), Q_MIN, Q_MAX)
 
-        if self._motion is None:
-            # step() called before reset() -- start the tracking motion
-            # from the robot's current actual position rather than
-            # failing outright.
-            self._ensure_motion_started(self.get_state()[:7])
+        q_now = self.get_state()[:7]
+        delta = np.abs(u_star - q_now)
+        if np.any(delta > self._max_step_delta):
+            self.faulted = True
+            raise RuntimeError(
+                f"step(): u_star differs from current position by up to "
+                f"{delta.max():.4f} rad (limit {self._max_step_delta}) -- "
+                f"REFUSING to send this to the torque-based tracking "
+                f"controller (see module docstring: large jumps through "
+                f"JointImpedanceTrackingMotion cause fast, forceful "
+                f"motion). u_star={u_star}, q_now={q_now}")
 
-        self._safe_call(self._motion.set_reference, franky.JointReference(q=u_star))
+        self._safe_call(self._tracking_motion.set_reference, franky.JointReference(q=u_star))
 
         elapsed = time.monotonic() - t0
         remaining = self.control_dt - elapsed
@@ -164,15 +194,14 @@ class FrankyHwEnv:
         return np.asarray(pose.end_effector_pose.translation, dtype=np.float64)
 
     def stop(self):
-        """Explicitly stop the tracking motion (e.g. at the end of a run).
-        Not called automatically -- caller decides when the session is
-        truly over. Safe to call even if no motion was ever started."""
-        if self._motion is not None:
+        """Explicitly stop the tracking motion. Safe to call even if no
+        motion was ever started (e.g. reset() was never called)."""
+        if self._tracking_motion is not None:
             try:
                 self.robot.stop()
             except Exception:
-                pass  # best-effort; don't mask an earlier real error
-            self._motion = None
+                pass
+            self._tracking_motion = None
 
     # ---- safety helpers ---------------------------------------------------
     def _safe_call(self, fn, *args, **kwargs):
