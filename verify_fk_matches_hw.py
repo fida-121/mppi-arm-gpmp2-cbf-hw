@@ -1,29 +1,42 @@
-# verify_fk_matches_hw.py
+"""
+verify_fk_matches_hw.py
+=========================
+Verifies that FrankyHwEnv.ee_position() correctly uses FK (via the
+wired-in franka_model) to report the real gripper-tip position, rather
+than franky's raw current_pose (which reports the FLANGE, not the
+mounted Franka Hand gripper's tip -- a confirmed ~0.107m offset along Z,
+matching the MJCF's "hand" body pos="0 0 0.107" gripper-mount geometry).
+
+Uses main.py's build_default_system() so franka_model gets wired into
+env exactly as it does in a real run_closed_loop() call.
+
+Run from inside the franky-project container:
+    python3 verify_fk_matches_hw.py
+"""
 import numpy as np
-import mujoco
-from robot.franka import FrankaModel
-from robot.franky_hw import FrankyHwEnv
+from main import build_default_system
 
 ROBOT_IP = "172.16.0.2"
-MJCF_PATH = "assets/panda.xml"
 
-env = FrankyHwEnv(robot_ip=ROBOT_IP, dynamics_factor=0.05)
-model = mujoco.MjModel.from_xml_path(MJCF_PATH)
-franka = FrankaModel(model, mujoco.MjData(model))
+env, franka, sdf, barrier, qp = build_default_system(
+    mjcf_path="assets/panda.xml", use_hardware=True, robot_ip=ROBOT_IP)
 
-state = env.get_state()
-q = state[:7]
+print("franka_model wired in?", env.franka_model is not None)
 
-centers, jacs = franka.fk(q)   # <-- unpack the tuple correctly
-print("Number of spheres:", centers.shape[0])
-ee_from_fk = centers[-1]       # last sphere center, closest to end-effector
-
+ee_via_fk = env.ee_position()
 pose = env.robot.current_pose
-ee_from_franky = np.array(pose.end_effector_pose.translation)
+ee_via_flange = np.array(pose.end_effector_pose.translation)
 
-print("Last sphere center (from franka.fk): ", np.round(ee_from_fk, 4))
-print("EE from franky pose:                  ", np.round(ee_from_franky, 4))
-print("Difference (should be small):         ", np.round(ee_from_fk - ee_from_franky, 4))
-print(env.robot.current_pose)
-# also check if there's a separate flange pose accessor:
-help(franky.Robot.current_pose)  # or check franky docs for "flange" vs "end_effector"
+print("ee_position() [FK-based, gripper-tip]:", np.round(ee_via_fk, 4))
+print("raw flange pose (for comparison):     ", np.round(ee_via_flange, 4))
+diff = ee_via_fk - ee_via_flange
+print("Difference (X,Y should be ~0, Z should be ~0.107, the known "
+      "gripper-mount offset):", np.round(diff, 4))
+
+if abs(diff[2] - 0.107) < 0.03:
+    print("\nOK: Z offset is consistent with the known gripper-mount "
+          "geometry -- ee_position() is correctly using FK.")
+else:
+    print("\nWARNING: Z offset does not match the expected ~0.107m "
+          "gripper-mount offset -- investigate before trusting "
+          "ee_position() for logging/visualization.")
