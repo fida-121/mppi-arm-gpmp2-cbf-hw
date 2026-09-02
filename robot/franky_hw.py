@@ -133,7 +133,13 @@ class FrankyHwEnv:
         # documented as NOT the true gripper-tip position.
         pose = self._safe_call(lambda: self.robot.current_pose)
         return np.asarray(pose.end_effector_pose.translation, dtype=np.float64)
-
+    def stop(self):
+        """Explicitly stop any running motion. Safe to call at any time,
+        including if no motion was ever started."""
+        try:
+            self.robot.stop()
+        except Exception:
+            pass  # best-effort; don't mask an earlier real error
     # ---- safety helpers ---------------------------------------------------
     def _safe_call(self, fn, *args, **kwargs):
         if self.faulted:
