@@ -36,38 +36,52 @@ from robot.mujoco_env import MujocoFrankaEnv
 
 
 def build_default_system(mjcf_path: str, obstacle_center=(0.5, 0.0, 0.4),
-                          obstacle_radius: float = 0.08, d_safe: float = 0.05):
+                          obstacle_radius: float = 0.08, d_safe: float = 0.05,
+                          use_hardware: bool = False, robot_ip: str = "172.16.0.2"):
     import mujoco
-    env = MujocoFrankaEnv(mjcf_path=mjcf_path, obstacle_center=obstacle_center,
-                          obstacle_radius=obstacle_radius)
-    # IMPORTANT: FrankaModel gets its OWN MjData, separate from env.data.
-    # FrankaModel.fk_batch() (called every MPPI step to score rollout
-    # candidates) writes candidate joint positions directly into
-    # self.data.qpos -- if that were env.data (shared with the actual
-    # simulation), every MPPI cost evaluation would silently overwrite
-    # the real robot state with a fake rollout position, and env.step()
-    # could then advance physics from the wrong state. This was a real
-    # bug in every earlier version of this file.
-    franka = FrankaModel(env.model, mujoco.MjData(env.model))
+
+    # Build the MuJoCo model independently of which env we use -- needed
+    # purely for FK (FrankaModel), never for physics stepping when on
+    # hardware. Previously this borrowed env.model, which doesn't exist
+    # on FrankyHwEnv (no MuJoCo model on real hardware).
+    model = mujoco.MjModel.from_xml_path(mjcf_path)
+
+    if use_hardware:
+        from robot.franky_hw import FrankyHwEnv
+        env = FrankyHwEnv(robot_ip=robot_ip, dynamics_factor=0.05,
+                           obstacle_center=obstacle_center, obstacle_radius=obstacle_radius,
+                           velocity_safety_factor=0.5)
+    else:
+        env = MujocoFrankaEnv(mjcf_path=mjcf_path, obstacle_center=obstacle_center,
+                               obstacle_radius=obstacle_radius)
+
+    # IMPORTANT: FrankaModel gets its OWN MjData, separate from env.data
+    # (when env is sim) or from anything hardware-side (when env is
+    # FrankyHwEnv). FrankaModel.fk_batch() (called every MPPI step to
+    # score rollout candidates) writes candidate joint positions directly
+    # into self.data.qpos -- if that were env.data (shared with the
+    # actual simulation), every MPPI cost evaluation would silently
+    # overwrite the real robot state with a fake rollout position, and
+    # env.step() could then advance physics from the wrong state. This
+    # was a real bug in every earlier version of this file.
+    franka = FrankaModel(model, mujoco.MjData(model))
+
+    if use_hardware:
+        # Wire franka into the hw env so ee_position() can compute the
+        # real gripper-tip position via FK, matching sim's convention --
+        # franky's own current_pose reports the flange, not the mounted
+        # gripper's tip (confirmed ~0.107m offset via direct testing).
+        env.franka_model = franka
 
     sdf = SignedDistanceField(
         obstacle_centers=np.array([env.obstacle_center]),
         obstacle_radii=np.array([env.obstacle_radius]))
-
     barrier = DistanceBarrier(fk_fn=franka.fk, sphere_radii=franka.sphere_radii,
                                sdf=sdf, dof=DOF, d_safe=d_safe)
-    # h(x) = d(x) - d_safe, exactly as specified -- no training needed,
-    # d(x) is the minimum robot-sphere-to-obstacle clearance (Section 3
-    # equivalent, computed analytically via forward kinematics + SDF).
-
     JOINT_LOWER = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
     JOINT_UPPER = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973])
     qp = CBFQPSolver(m=DOF, u_min=JOINT_LOWER, u_max=JOINT_UPPER, alpha_gamma=100.0)
-    # Bounds are now POSITION limits, not torque limits -- the QP finds
-    # the closest safe desired-position to MPPI's proposal, not a torque.
-
     return env, franka, sdf, barrier, qp
-
 
 def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
                      n_mppi_samples: int = 200, n_planning_cycles: int = 20,
@@ -75,7 +89,8 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
                      obstacle_radius: float = 0.08, d_safe: float = 0.05,
                      tau_conflict: float = 0.05, tau_safe: float = 0.2,
                      lambda_cbf: float = 1.0, gpmp2_eps: float = 0.03,
-                     gpmp2_sigma_obs: float = 0.02, on_stage=None):
+                     gpmp2_sigma_obs: float = 0.02, on_stage=None,
+                     use_hardware: bool = False, robot_ip: str = "172.16.0.2"):
     """
     on_stage: optional callable(stage_name: str, info: dict) -> None,
     invoked at each of the 8 pipeline stages with whatever data is
@@ -94,12 +109,19 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
     rng = np.random.default_rng(rng_seed)
     env, franka, sdf, barrier, qp = build_default_system(
         mjcf_path, obstacle_center=obstacle_center,
-        obstacle_radius=obstacle_radius, d_safe=d_safe)
+        obstacle_radius=obstacle_radius, d_safe=d_safe,
+        use_hardware=use_hardware, robot_ip=robot_ip)
 
-    q0 = np.zeros(DOF)
+    q0 = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])  # Franka's
+    # standard "ready" home pose -- verified safe on this robot via
+    # stage_2c_joint.py (Stage 2c multi-waypoint test), not the
+    # arbitrary all-zeros configuration.
     q_goal = np.array([0.4, -0.3, 0.2, -1.8, 0.1, 1.6, 0.5])
     theta0 = np.concatenate([q0, np.zeros(DOF)])
     theta_goal = np.concatenate([q_goal, np.zeros(DOF)])
+    if use_hardware:
+        print(f"About to move to start pose: {q0}")
+        input("Press Enter to confirm hardware start move (Ctrl+C to abort)...")
     env.reset(q0)
 
     Qc = 0.5 * np.eye(DOF)
@@ -253,7 +275,13 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
             _emit("CBF-QP", qp_result=qp_result, unsafe=unsafe, u_mppi=u_mppi, cycle=cycle, k=k)
 
             # ---- Stage 6: execute u* only -----------------------------------
-            env.step(qp_result.u_safe)
+            try:
+                env.step(qp_result.u_safe)
+            except RuntimeError as e:
+                print(f"HARDWARE FAULT — stopping loop: {e}")
+                if use_hardware:
+                    env.stop()
+                return history, feas_log, cov_steer
             _emit("Robot Execution", q=q, qdot=qdot, u_safe=qp_result.u_safe,
                   ee_position=env.ee_position(), t=global_t, cycle=cycle, k=k)
 
@@ -389,6 +417,8 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
     # the trajectory the accept/rollback guard would return to anyway.
     history["best_goal_error"] = best_goal_err
     history["best_theta_star"] = best_theta_star
+    if use_hardware:
+        env.stop()
 
     return history, feas_log, cov_steer
 
@@ -397,5 +427,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mjcf", type=str, default="assets/panda.xml")
     parser.add_argument("--cycles", type=int, default=5)
+    parser.add_argument("--hardware", action="store_true")
+    parser.add_argument("--robot-ip", type=str, default="172.16.0.2")
     args = parser.parse_args()
-    run_closed_loop(mjcf_path=args.mjcf, n_planning_cycles=args.cycles)
+    run_closed_loop(mjcf_path=args.mjcf, n_planning_cycles=args.cycles,
+                     use_hardware=args.hardware, robot_ip=args.robot_ip)

@@ -18,8 +18,8 @@ SAFETY: every franky call that talks to the robot is wrapped; any
 exception sets self.faulted=True and re-raises, so the calling loop
 (main.py) stops rather than silently continuing on stale state. Wrap
 env.step() in main.py's loop in a try/except RuntimeError before
-running this on hardware -- see bottom of this file for the exact
-patch.
+running this on hardware -- see build_default_system() in main.py for
+how franka_model gets wired in below.
 """
 from __future__ import annotations
 import time
@@ -42,6 +42,9 @@ class FrankyHwEnv:
         self.obstacle_center = np.array(obstacle_center)
         self.obstacle_radius = obstacle_radius
         self.faulted = False
+        self.franka_model = None  # set externally by build_default_system() once
+        # the FrankaModel exists -- see main.py's build_default_system()
+        # for the wiring: env.franka_model = franka
 
         try:
             self.robot = franky.Robot(
@@ -116,12 +119,27 @@ class FrankyHwEnv:
         return np.concatenate([q, qdot])
 
     def ee_position(self, ee_body_name: str = "hand") -> np.ndarray:
-        """NOTE: ee_body_name is accepted for interface parity with
-        MujocoFrankaEnv but ignored here -- franky gives the real robot's
-        Cartesian pose directly (no MJCF body names on hardware)."""
+        """Returns the gripper-tip position via FK (matching sim's convention),
+        NOT franky's raw current_pose (which reports the flange, not the
+        mounted gripper's tip -- confirmed ~0.107m offset via direct testing).
+        Requires self.franka_model to be set externally (see
+        build_default_system() in main.py); falls back to the raw flange
+        pose (documented as inaccurate) if it hasn't been wired in."""
+        if self.franka_model is not None:
+            q = self.get_state()[:7]
+            centers, _ = self.franka_model.fk(q)
+            return centers[-1]
+        # Fallback if no franka_model was provided -- flange position,
+        # documented as NOT the true gripper-tip position.
         pose = self._safe_call(lambda: self.robot.current_pose)
         return np.asarray(pose.end_effector_pose.translation, dtype=np.float64)
-
+    def stop(self):
+        """Explicitly stop any running motion. Safe to call at any time,
+        including if no motion was ever started."""
+        try:
+            self.robot.stop()
+        except Exception:
+            pass  # best-effort; don't mask an earlier real error
     # ---- safety helpers ---------------------------------------------------
     def _safe_call(self, fn, *args, **kwargs):
         if self.faulted:
@@ -139,18 +157,3 @@ class FrankyHwEnv:
         if np.any(q < Q_MIN - 0.05) or np.any(q > Q_MAX + 0.05):
             self.faulted = True
             raise RuntimeError(f"Joint position outside limits (with margin): {q} -- STOPPING.")
-
-
-# ---------------------------------------------------------------------------
-# REQUIRED patch to main.py before running this on hardware:
-# the closed loop currently has no try/except around env.step(). Wrap it:
-#
-#     try:
-#         env.step(qp_result.u_safe)
-#     except RuntimeError as e:
-#         print(f"HARDWARE FAULT -- stopping loop: {e}")
-#         break
-#
-# Without this, a FrankyHwEnv fault propagates as an unhandled exception
-# mid-loop instead of a clean, logged stop.
-# ---------------------------------------------------------------------------
