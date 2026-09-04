@@ -1,15 +1,17 @@
 """
 test_franky_hw_fix.py
 =======================
-Isolated verification of the fixed FrankyHwEnv, BEFORE re-running the
-full closed-loop pipeline. Tests, in order:
+Isolated verification of FrankyHwEnv v6 (Ruckig-planned step() with
+position-delta clamping + kinematically-consistent velocity, fixed
+control_dt=0.05s). Tests, in order:
 
   1. reset() to the known-safe home pose -- should move smoothly at
      normal (Ruckig-limited) speed, NOT rapidly/violently.
-  2. step() with small deltas -- should track smoothly, no stutter
-     (this re-verifies the earlier sine-sweep fix still works).
-  3. step() with an intentionally large delta -- should be REFUSED
-     (RuntimeError) by the max_step_delta safety guard, NOT executed.
+  2. step() with small deltas -- should track smoothly, no stutter.
+  3. step() with a delta LARGER than achievable in one control_dt --
+     should move at max safe speed toward the target (clamped), closing
+     the rest of the gap over the next few step() calls, WITHOUT a
+     reflex fault and WITHOUT violent motion.
 
 Run this from inside the franky-project container:
     python3 test_franky_hw_fix.py
@@ -19,12 +21,10 @@ hardware test in this project.
 """
 import numpy as np
 import time
-from robot.franky_hw import FrankyHwEnv
+from robot.franky_hw import FrankyHwEnv, FRANKA_MAX_JOINT_VEL, VELOCITY_SAFETY_FACTOR
 
 ROBOT_IP = "172.16.0.2"  # confirm this matches your robot's actual FCI IP
 
-# Franka's standard "ready" home pose -- verified safe/reachable on this
-# robot in earlier stage tests (stage_2c_joint.py).
 Q_HOME = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
 
 
@@ -62,7 +62,7 @@ def main():
     input("Press Enter to run the sweep (Ctrl+C to abort)...")
 
     for i in range(40):
-        target[5] = q_start[5] + 0.1 * np.sin(i / 40 * np.pi)  # smooth, small
+        target[5] = q_start[5] + 0.1 * np.sin(i / 40 * np.pi)
         state = env.step(target)
         print(f"[{i:2d}] q6={state[5]:.4f}")
     print("Sweep complete -- check the printed values above for a smooth "
@@ -70,21 +70,30 @@ def main():
 
     print()
     print("=" * 60)
-    print("TEST 3: step() with a LARGE delta -- should be REFUSED")
+    print("TEST 3: step() with a delta LARGER than one cycle's reach")
     print("=" * 60)
+    max_delta_j0 = VELOCITY_SAFETY_FACTOR * FRANKA_MAX_JOINT_VEL[0] * env.control_dt
+    print(f"Max achievable delta on joint 1 in one control_dt: "
+          f"~{max_delta_j0:.4f} rad")
     q_now = env.get_state()[:7]
     bad_target = q_now.copy()
-    bad_target[0] += 0.5  # intentionally large -- exceeds default
-    # max_step_delta=0.05, should be rejected before any motion happens.
-    print("Attempting a deliberately large step() delta (should be "
-          "refused, not executed)...")
-    try:
-        env.step(bad_target)
-        print("!!! UNEXPECTED: step() did NOT refuse the large delta. "
-              "This means the safety guard did not trigger -- "
-              "investigate before any further hardware testing.")
-    except RuntimeError as e:
-        print(f"Correctly refused, as expected:\n  {e}")
+    bad_target[0] += 3 * max_delta_j0  # deliberately ~3x the achievable
+    # distance -- should be gracefully clamped, not hard-faulted (that's
+    # well under HARD_FAULT_MULTIPLIER=5x) and not violent.
+    print(f"Requesting a delta of {3*max_delta_j0:.4f} rad on joint 1 "
+          f"(~3x achievable per cycle).")
+    print("This should move at a CONTROLLED max-safe speed toward the "
+          "target -- NOT a violent snap, and NOT a reflex fault.")
+    input("Press Enter to send this (Ctrl+C to abort)...")
+
+    for i in range(10):
+        state = env.step(bad_target)
+        print(f"[{i}] q0={state[0]:.4f}  (target={bad_target[0]:.4f}, "
+              f"remaining gap={bad_target[0]-state[0]:.4f})")
+    print("\nGap should be shrinking each cycle without any fault above.")
+    input("Did this feel controlled/bounded rather than violent, and did "
+          "it run without a reflex fault? Press Enter to finish "
+          "(Ctrl+C to stop here)...")
 
     print()
     env.stop()
