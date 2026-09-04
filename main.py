@@ -15,6 +15,10 @@ executable entry point: `python main.py --config configs/default.yaml`
 
 from __future__ import annotations
 import argparse
+import csv
+import json
+import os
+import time
 import numpy as np
 import gtsam
 
@@ -49,8 +53,7 @@ def build_default_system(mjcf_path: str, obstacle_center=(0.5, 0.0, 0.4),
     if use_hardware:
         from robot.franky_hw import FrankyHwEnv
         env = FrankyHwEnv(robot_ip=robot_ip, dynamics_factor=0.05,
-                           obstacle_center=obstacle_center, obstacle_radius=obstacle_radius,
-                           velocity_safety_factor=0.5)
+                           obstacle_center=obstacle_center, obstacle_radius=obstacle_radius)
     else:
         env = MujocoFrankaEnv(mjcf_path=mjcf_path, obstacle_center=obstacle_center,
                                obstacle_radius=obstacle_radius)
@@ -83,6 +86,108 @@ def build_default_system(mjcf_path: str, obstacle_center=(0.5, 0.0, 0.4),
     qp = CBFQPSolver(m=DOF, u_min=JOINT_LOWER, u_max=JOINT_UPPER, alpha_gamma=100.0)
     return env, franka, sdf, barrier, qp
 
+
+def _build_summary(history, d_safe, obstacle_center, q_goal, q0, success_threshold):
+    """Per-run summary (Table I fields). Pure data collection -- reads
+    only values already produced in `history`, never feeds back into or
+    alters any control/replanning decision. Factored out so it can be
+    called from every exit path of run_closed_loop (normal completion
+    AND the early-return-on-hardware-fault path), not just the end."""
+    if len(history["goal_error"]) == 0:
+        # Faulted before a single control step completed -- nothing to summarize.
+        final_goal_error = float("nan")
+        min_clearance = float("nan")
+        h_min = float("nan")
+    else:
+        final_goal_error = history["goal_error"][-1]
+        min_clearance = float(np.min(history["dist"]))
+        h_min = float(np.min(history["h"]))
+    n_conflict_events = len(history["conflicts"])
+    # NaN-safe: a NaN final_goal_error (faulted before any step) is never "success".
+    success = bool(final_goal_error < success_threshold) if final_goal_error == final_goal_error else False
+
+    return {
+        "final_goal_error": final_goal_error,
+        "min_clearance": min_clearance,
+        "h_min": h_min,
+        "n_conflict_events": n_conflict_events,
+        "success": success,
+        "success_threshold": success_threshold,
+        "d_safe": d_safe,
+        "obstacle_position": tuple(obstacle_center),
+        "goal_position": q_goal.tolist(),
+        "start_position": q0.tolist(),
+    }
+
+
+def save_results(history, out_dir="results", tag=None):
+    """Persist the per-run summary (JSON, small/always) and the full
+    per-timestep trace — both CSV and NPZ — to disk, all sharing the same
+    timestamped stem so a JSON/CSV/NPZ triple from one run is easy to
+    identify together. Called automatically at the end of run_closed_loop
+    -- this is the actual save step; before this, `history` only ever
+    existed in memory and nothing wrote to disk.
+    Returns (summary_path, trace_csv_path, trace_npz_path)."""
+    os.makedirs(out_dir, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    stem = f"run_{timestamp}" + (f"_{tag}" if tag else "")
+
+    summary_path = os.path.join(out_dir, f"{stem}_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(history["summary"], f, indent=2)
+
+    # ---- CSV per-timestep trace --------------------------------------------
+    # This is what feeds the safety-over-time figure (h(x) vs timestep/real
+    # time), matching fig_exp3_4_feasibility.png. Vector fields (q, u_mppi,
+    # u_safe) are flattened into one column per joint so the CSV stays
+    # spreadsheet/pandas-friendly. `conflict` is 1 on any timestep that
+    # appears in history["conflicts"], else 0.
+    trace_csv_path = os.path.join(out_dir, f"{stem}_trace.csv")
+    n_steps = len(history["timestep"])
+    dof = len(history["q"][0]) if n_steps > 0 else 0
+    conflict_steps = set(history["conflicts"])
+
+    with open(trace_csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        header = (["timestep", "real_time", "h", "goal_error", "dist",
+                    "cost_history", "conflict"]
+                   + [f"q_{i}" for i in range(dof)]
+                   + [f"u_mppi_{i}" for i in range(dof)]
+                   + [f"u_safe_{i}" for i in range(dof)])
+        writer.writerow(header)
+        for idx in range(n_steps):
+            t = history["timestep"][idx]
+            row = ([t, history["real_time"][idx], history["h"][idx],
+                     history["goal_error"][idx], history["dist"][idx],
+                     history["cost_history"][idx], int(t in conflict_steps)]
+                    + list(history["q"][idx])
+                    + list(history["u_mppi"][idx])
+                    + list(history["u_safe"][idx]))
+            writer.writerow(row)
+
+    # ---- NPZ per-timestep trace (kept alongside CSV -- compact for bulk
+    # post-processing across many runs; CSV is the one you'll open by hand
+    # or feed straight into a plotting script for a single run's figure) ---
+    trace_npz_path = os.path.join(out_dir, f"{stem}_trace.npz")
+    np.savez(
+        trace_npz_path,
+        timestep=np.array(history["timestep"]),
+        real_time=np.array(history["real_time"]),
+        q=np.array(history["q"]),
+        u_mppi=np.array(history["u_mppi"]),
+        u_safe=np.array(history["u_safe"]),
+        h=np.array(history["h"]),
+        cost_history=np.array(history["cost_history"]),
+        goal_error=np.array(history["goal_error"]),
+        dist=np.array(history["dist"]),
+        conflicts=np.array(history["conflicts"]),
+    )
+    print(f"[save_results] summary   -> {summary_path}")
+    print(f"[save_results] trace csv -> {trace_csv_path}")
+    print(f"[save_results] trace npz -> {trace_npz_path}")
+    return summary_path, trace_csv_path, trace_npz_path
+
+
 def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
                      n_mppi_samples: int = 200, n_planning_cycles: int = 20,
                      rng_seed: int = 0, obstacle_center=(0.5, 0.0, 0.4),
@@ -90,7 +195,8 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
                      tau_conflict: float = 0.05, tau_safe: float = 0.2,
                      lambda_cbf: float = 1.0, gpmp2_eps: float = 0.03,
                      gpmp2_sigma_obs: float = 0.02, on_stage=None,
-                     use_hardware: bool = False, robot_ip: str = "172.16.0.2"):
+                     use_hardware: bool = False, robot_ip: str = "172.16.0.2",
+                     success_threshold: float = 0.05):
     """
     on_stage: optional callable(stage_name: str, info: dict) -> None,
     invoked at each of the 8 pipeline stages with whatever data is
@@ -101,6 +207,11 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
     function always made; the hook only observes, never alters, the
     pipeline. Default None means zero behavior change for every
     existing caller (run_experiments.py, experiments/adaptive_loop.py).
+
+    success_threshold: goal_error (inf-norm, rad) below which a run is
+    counted as successful in the per-run summary. Only used for logging
+    the "success" field below -- does not affect control/replanning
+    logic anywhere in this function.
     """
     def _emit(stage, **info):
         if on_stage is not None:
@@ -113,6 +224,7 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
         use_hardware=use_hardware, robot_ip=robot_ip)
 
     q0 = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])  # Franka's
+    #q0 = np.array([0.53, -0.599, -1.346, -1.504, -0.531, 1.521, -0.005])
     # standard "ready" home pose -- verified safe on this robot via
     # stage_2c_joint.py (Stage 2c multi-waypoint test), not the
     # arbitrary all-zeros configuration.
@@ -201,7 +313,9 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
                "cost_history": [], "goal_error": [], "dist": [],
                "cycle_end_goal_error": [], "cycle_end_min_clear": [],
                "replan_accepted": [], "replan_new_error": [], "replan_baseline_error": [],
-               "rolled_back_to_best": []}
+               "rolled_back_to_best": [],
+               # --- per-timestep trace additions (data-collection only) ---
+               "timestep": [], "real_time": []}
 
     # Outcome-based checkpoint: tracks the trajectory that produced the
     # BEST real goal_err actually achieved by the robot, as opposed to
@@ -223,6 +337,7 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
     best_theta_star = None
     rollback_tolerance = 0.05  # rad -- how much worse than best before rolling back
     global_t = 0
+    run_start_time = time.perf_counter()  # wall-clock reference for "real_time" trace field
     for cycle in range(n_planning_cycles):
         theta_q_ref = theta_star[:, :DOF]  # position block used as MPPI mean
 
@@ -281,6 +396,12 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
                 print(f"HARDWARE FAULT — stopping loop: {e}")
                 if use_hardware:
                     env.stop()
+                # Build + save the summary here too -- previously this early
+                # return skipped the summary entirely, since that block only
+                # existed after the full cycle loop below.
+                history["summary"] = _build_summary(
+                    history, d_safe, obstacle_center, q_goal, q0, success_threshold)
+                save_results(history, tag="FAULTED")
                 return history, feas_log, cov_steer
             _emit("Robot Execution", q=q, qdot=qdot, u_safe=qp_result.u_safe,
                   ee_position=env.ee_position(), t=global_t, cycle=cycle, k=k)
@@ -324,6 +445,9 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
             history["cost_history"].append(float(np.mean(mppi_result.costs)))
             history["goal_error"].append(float(np.linalg.norm(q - q_goal, ord=np.inf)))
             history["dist"].append(d_obs)
+            # --- per-timestep trace additions (data-collection only) ---
+            history["timestep"].append(global_t)
+            history["real_time"].append(time.perf_counter() - run_start_time)
             global_t += 1
 
         # ---- Per-cycle convergence diagnostic: goal error and worst-case
@@ -420,6 +544,14 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
     if use_hardware:
         env.stop()
 
+    # ---- Per-run summary (Table I fields) --------------------------------
+    history["summary"] = _build_summary(
+        history, d_safe, obstacle_center, q_goal, q0, success_threshold)
+
+    # ---- Actually persist to disk -----------------------------------------
+    # This is the step that was missing before: history lived in memory only.
+    save_results(history)
+
     return history, feas_log, cov_steer
 
 
@@ -430,5 +562,9 @@ if __name__ == "__main__":
     parser.add_argument("--hardware", action="store_true")
     parser.add_argument("--robot-ip", type=str, default="172.16.0.2")
     args = parser.parse_args()
-    run_closed_loop(mjcf_path=args.mjcf, n_planning_cycles=args.cycles,
-                     use_hardware=args.hardware, robot_ip=args.robot_ip)
+    history, feas_log, cov_steer = run_closed_loop(
+        mjcf_path=args.mjcf, n_planning_cycles=args.cycles,
+        use_hardware=args.hardware, robot_ip=args.robot_ip)
+    # save_results() already ran inside run_closed_loop and printed the
+    # file paths -- this just echoes the summary to the console too.
+    print(history["summary"])

@@ -12,8 +12,10 @@ print("Current position:", np.round(env.get_state()[:7], 3))
 # Absolute joint targets -- YOUR chosen values, in radians, one array
 # per waypoint. These are exact configurations, not offsets.
 waypoints_q = [
-    np.array([ 0.012, -0.637,  0.022, -2.655, -0.003,  2.173,  0.771]),  # example: current + wrist tweak
-    np.array([ 0.012, -0.587,  0.022, -2.655, -0.003,  2.073,  0.921]),  # example: another pose
+    np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]) #home
+    #np.array([0.53, -0.599, -1.346, -1.504, -0.531, 1.521, -0.005]) #new home
+    #np.array([ 0.4, -0.3,  0.2, -1.8, 0.1,  1.6,  0.5]),  # example: current + wrist tweak
+    #np.array([ 0.012, -0.587,  0.022, -2.655, -0.003,  2.073,  0.921]),  # example: another pose
 ]
 
 print("Absolute target waypoints:")

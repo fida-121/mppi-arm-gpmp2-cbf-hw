@@ -1,0 +1,32 @@
+{
+  "final_goal_error": 0.02609029794140838,
+  "min_clearance": 0.2247532922784084,
+  "h_min": 0.1247532922784084,
+  "n_conflict_events": 2,
+  "success": true,
+  "success_threshold": 0.05,
+  "d_safe": 0.1,
+  "obstacle_position": [
+    0.536,
+    0.139,
+    0.356
+  ],
+  "goal_position": [
+    0.4,
+    -0.3,
+    0.2,
+    -1.8,
+    0.1,
+    1.6,
+    0.5
+  ],
+  "start_position": [
+    0.0,
+    -0.785,
+    0.0,
+    -2.356,
+    0.0,
+    1.571,
+    0.785
+  ]
+}
