@@ -1,0 +1,42 @@
+{
+  "final_goal_error": 0.01012392707549159,
+  "min_clearance": 0.22246335401105233,
+  "h_min": 0.12246335401105232,
+  "n_conflict_events": 1,
+  "success": true,
+  "success_threshold": 0.05,
+  "d_safe": 0.1,
+  "obstacle_position": [
+    0.536,
+    0.139,
+    0.356
+  ],
+  "goal_position": [
+    0.4,
+    -0.3,
+    0.2,
+    -1.8,
+    0.1,
+    1.6,
+    0.5
+  ],
+  "start_position": [
+    0.0,
+    -0.785,
+    0.0,
+    -2.356,
+    0.0,
+    1.571,
+    0.785
+  ],
+  "t_mppi_mean_s": 0.2195086675500079,
+  "t_mppi_max_s": 0.6978305989996443,
+  "t_cbf_mean_s": 0.00156285719999687,
+  "t_cbf_max_s": 0.0018165839992434485,
+  "t_robot_mean_s": 0.0006388896001226386,
+  "t_robot_max_s": 0.0007386679999399348,
+  "t_gpmp2_per_cycle_mean_s": 0.050794436332883684,
+  "t_gpmp2_per_cycle_max_s": 0.05838079499972082,
+  "achieved_control_loop_hz": 4.403734993439168,
+  "target_control_loop_hz": 20.0
+}
