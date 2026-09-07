@@ -95,6 +95,8 @@ class SharedMPPIState:
         # an initial guess of "zero delay" would under-compensate for
         # latency on the very first MPPI iteration.
         self.mppi_compute_time_ema = control_dt
+        self.last_mppi_compute_time = float("nan")  # no rollout completed yet
+        self.last_mppi_cost = float("nan")
         self.stop = False
 
     def publish_robot_state(self, q: np.ndarray, qdot: np.ndarray):
@@ -108,13 +110,15 @@ class SharedMPPIState:
             q, qdot = self.robot_state
             return q.copy(), qdot.copy()
 
-    def publish_tape(self, tape: np.ndarray, compute_time: float):
+    def publish_tape(self, tape: np.ndarray, compute_time: float, cost: float):
         with self._lock:
             self.tape = tape
             self.tape_time = time.perf_counter()
             # Exponential moving average -- smooths out one-off slow/fast
             # MPPI iterations so latency compensation doesn't jitter.
             self.mppi_compute_time_ema = 0.7 * self.mppi_compute_time_ema + 0.3 * compute_time
+            self.last_mppi_compute_time = compute_time
+            self.last_mppi_cost = cost
 
     def get_tape_index(self):
         """How far along the current tape the control thread should be,
@@ -129,6 +133,18 @@ class SharedMPPIState:
     def get_expected_delay(self) -> float:
         with self._lock:
             return self.mppi_compute_time_ema
+
+    def get_last_mppi_stats(self):
+        """Returns (last_mppi_compute_time, last_mppi_cost) -- the RAW
+        duration/cost of the most recently completed rollout, not the
+        EMA (which is smoothed and only meant for latency compensation).
+        Used by control_thread_fn to fill the t_mppi/cost_history columns
+        with "the most recently known value as of this tick" rather than
+        a per-tick measurement that doesn't exist in this architecture --
+        see the note in control_thread_fn for why that's the honest thing
+        to log here."""
+        with self._lock:
+            return self.last_mppi_compute_time, self.last_mppi_cost
 
 
 def control_thread_fn(shared: SharedMPPIState, env, franka, barrier, qp, f_fn, g_fn,
@@ -153,9 +169,19 @@ def control_thread_fn(shared: SharedMPPIState, env, franka, barrier, qp, f_fn, g
         x = np.concatenate([q, qdot])
 
         goal_error = float(np.max(np.abs(q - q_goal)))
-        if goal_error < goal_threshold:
-            time.sleep(shared.control_dt)
-            continue
+        # NOTE: previously this branch did `continue` here -- skipping CBF-QP,
+        # env.step(), AND the entire history-logging block below the moment
+        # goal_error first dipped under goal_threshold. That meant the run's
+        # monitor loop (in run_mppi_async_hardware) only ever saw a single
+        # instantaneous crossing, never confirmation the arm actually STAYED
+        # near the goal -- and if goal_error ticked back up afterward (as it
+        # did repeatedly in testing, 0.06 -> 0.3+ -> ...), nothing kept
+        # logging to show that. Removed: every tick now runs the full
+        # CBF-QP/step/log sequence regardless of goal_error, so the monitor
+        # loop's hysteresis check (added there) has real, continuous data to
+        # confirm settling on, and the arm is never left executing a stale
+        # last command while unmonitored. The extra QP solve at goal is
+        # negligible (t_cbf averages ~5.6ms, well inside the ~50ms budget).
 
         u_mppi = shared.get_tape_index()
 
@@ -163,8 +189,17 @@ def control_thread_fn(shared: SharedMPPIState, env, franka, barrier, qp, f_fn, g
         d_obs = closest_clearance(franka.fk, franka.sphere_radii, barrier.sdf, q)
         unsafe = detect_unsafe(u_mppi, Lf_psi1, Lg_psi1, psi1, alpha_gamma=alpha_gamma,
                                 d_obstacle=d_obs, h0_physical=h0)
-        qp_result = qp.solve(u_mppi, Lf_psi1, Lg_psi1, psi1, h0_physical=h0)
 
+        # ---- t_cbf: genuinely per-tick in this architecture, unlike t_mppi
+        # below -- CBF-QP runs on THIS thread, once per control tick, so this
+        # is a real per-tick measurement, not a broadcast of a stale value.
+        t_cbf_start = time.perf_counter()
+        qp_result = qp.solve(u_mppi, Lf_psi1, Lg_psi1, psi1, h0_physical=h0)
+        t_cbf = time.perf_counter() - t_cbf_start
+
+        # ---- t_robot: also genuinely per-tick -- env.step() runs on THIS
+        # thread, once per control tick.
+        t_robot_start = time.perf_counter()
         try:
             env.step(qp_result.u_safe)
         except RuntimeError as e:
@@ -175,6 +210,20 @@ def control_thread_fn(shared: SharedMPPIState, env, franka, barrier, qp, f_fn, g
             except Exception:
                 pass
             break
+        t_robot = time.perf_counter() - t_robot_start
+
+        # ---- t_mppi / cost_history: NOT a per-tick measurement in this
+        # architecture -- MPPI runs on its own thread at its own decoupled
+        # rate (see module docstring). Rather than log NaN (schema-
+        # compatible but useless) or nothing (schema-incompatible with
+        # main.py's save_results/CSV writer, which expects one entry per
+        # timestep), broadcast the most recently completed rollout's
+        # actual duration/cost onto every control tick until a newer one
+        # replaces it. This is honestly what it is: "how expensive/costly
+        # was the tape currently being followed, when it was computed" --
+        # not "the MPPI call for this tick", because no such thing exists
+        # here.
+        t_mppi, mppi_cost = shared.get_last_mppi_stats()
 
         feas_log.record(step_idx, unsafe, qp_result)
         history["q"].append(q.copy())
@@ -185,12 +234,11 @@ def control_thread_fn(shared: SharedMPPIState, env, franka, barrier, qp, f_fn, g
         history["dist"].append(d_obs)
         history["timestep"].append(step_idx)
         history["real_time"].append(time.perf_counter() - run_start_time)
-        history["cost_history"].append(float("nan"))  # not meaningful here -- see note below
-        # cost_history is per-MPPI-rollout, not per-control-tick, in this
-        # architecture (the two loops run at different, decoupled rates) --
-        # logged as NaN here rather than a misleading duplicated value.
-        # mppi_thread_fn below appends the real per-rollout cost separately
-        # into history["mppi_cost_history"].
+        history["cost_history"].append(mppi_cost)
+        history["t_mppi"].append(t_mppi)
+        history["t_cbf"].append(t_cbf)
+        history["t_robot"].append(t_robot)
+        history["intervention_magnitude"].append(float(qp_result.intervention_magnitude))
         step_idx += 1
 
 
@@ -203,6 +251,8 @@ def mppi_thread_fn(shared: SharedMPPIState, mppi: MPPIController, theta_ref_full
     it just means the control thread walks a somewhat stale tape
     between updates, which is exactly the tradeoff this architecture
     is meant to make explicit rather than hide."""
+    last_idx = 0  # monotonic progress marker along theta_ref_full -- see the
+    # note at its use below for why this can only increase, never decrease.
     while not shared.stop:
         q, qdot = shared.get_robot_state()
         if q is None:
@@ -225,7 +275,21 @@ def mppi_thread_fn(shared: SharedMPPIState, mppi: MPPIController, theta_ref_full
         # GPMP2 reference, and sample around the next n_lookahead points
         # of it -- this replaces per-cycle GPMP2 replanning, which is out
         # of scope for this file (see module docstring).
-        idx = int(np.argmin(np.linalg.norm(theta_ref_full - q_predicted, axis=1)))
+        #
+        # IMPORTANT: search only from last_idx onward, never the whole
+        # path. Searching globally (the original version) let idx snap
+        # BACKWARD near the goal -- if a noisy/predicted state happened to
+        # sit closer (in raw joint-space distance) to an earlier waypoint
+        # than to the true next one, the next tape would pull the arm back
+        # along its own path instead of holding position. In testing this
+        # produced repeated goal_error overshoot-then-retreat cycles
+        # (0.06 -> 0.3+ -> 0.06 -> ...) that never settled. Restricting the
+        # search to theta_ref_full[last_idx:] makes idx monotonically
+        # non-decreasing -- the reference can only move forward or hold,
+        # never backward.
+        local_dists = np.linalg.norm(theta_ref_full[last_idx:] - q_predicted, axis=1)
+        idx = last_idx + int(np.argmin(local_dists))
+        last_idx = idx
         ref_window = theta_ref_full[idx: idx + n_lookahead]
         if len(ref_window) < 2:
             # At/near the end of the reference -- hold the final pose so
@@ -238,9 +302,14 @@ def mppi_thread_fn(shared: SharedMPPIState, mppi: MPPIController, theta_ref_full
         mppi_result = mppi.step(ref_window, sigma, n_mppi_samples, K_inv_diag,
                                  barrier_batch_fn, rng)
         compute_time = time.perf_counter() - t0
+        mean_cost = float(np.mean(mppi_result.costs))
 
-        shared.publish_tape(mppi_result.u_mppi, compute_time)
-        history.setdefault("mppi_cost_history", []).append(float(np.mean(mppi_result.costs)))
+        shared.publish_tape(mppi_result.u_mppi, compute_time, mean_cost)
+        # Separate, genuine per-rollout log (one entry per MPPI iteration,
+        # NOT per control tick) -- this is the one to use if you want the
+        # real MPPI-rate timing/cost picture rather than the per-tick
+        # broadcast in history["t_mppi"]/history["cost_history"].
+        history.setdefault("mppi_cost_history", []).append(mean_cost)
         history.setdefault("mppi_compute_time", []).append(compute_time)
 
         if cov_steer is not None:
@@ -260,11 +329,18 @@ def run_mppi_async_hardware(mjcf_path: str, robot_ip: str = "172.16.0.2",
                              obstacle_center=(0.5, 0.0, 0.4), obstacle_radius: float = 0.08,
                              d_safe: float = 0.10, n_lookahead: int = 10,
                              n_mppi_samples: int = 200, gpmp2_N: int = 40,
+                             lambda_cbf: float = 1.0,
                              goal_threshold: float = 0.05, max_duration_s: float = 60.0,
                              rng_seed: int = 0):
     """Entry point wiring the two threads together. GPMP2 is solved once,
     here, before either thread starts -- see module docstring for why
-    this isn't itself a third thread."""
+    this isn't itself a third thread.
+
+    lambda_cbf: weights MPPI's own soft obstacle-avoidance cost term (same
+    meaning as in main.py's run_closed_loop) -- lower values leave MPPI's
+    raw proposals only weakly obstacle-aware, so the CBF-QP on the control
+    thread has real work to do. Now an actual parameter here (previously
+    hardcoded to 1.0 inside this function)."""
     rng = np.random.default_rng(rng_seed)
     env, franka, sdf, barrier, qp = build_default_system(
         mjcf_path, obstacle_center=obstacle_center, obstacle_radius=obstacle_radius,
@@ -283,7 +359,9 @@ def run_mppi_async_hardware(mjcf_path: str, robot_ip: str = "172.16.0.2",
     Qc = 0.5 * np.eye(DOF)
     planner = GPMP2Planner(dof=DOF, dt=0.05, Qc=Qc, sdf=sdf, fk_fn=franka.fk,
                             sphere_offsets=franka.sphere_radii, eps=0.03, sigma_obs=0.02)
+    t_gpmp2_start = time.perf_counter()
     gpmp2_result = planner.plan(theta0, theta_goal, N=gpmp2_N)
+    t_gpmp2_initial = time.perf_counter() - t_gpmp2_start
     theta_ref_full = gpmp2_result.theta_star[:, :DOF]
 
     def gravity_fn(q): return franka.gravity(q)
@@ -308,12 +386,18 @@ def run_mppi_async_hardware(mjcf_path: str, robot_ip: str = "172.16.0.2",
     # "Known limitation" note. Not fixed here; out of scope for this change.
 
     mppi = MPPIController(lam=1.0, dt=0.05, dof=DOF, sdf=sdf, eps_margin=0.15,
-                           sigma_obs=0.02, lambda_cbf=1.0, fk_batch_fn=franka.fk_batch,
+                           sigma_obs=0.02, lambda_cbf=lambda_cbf, fk_batch_fn=franka.fk_batch_vectorized,
                            sphere_radii=franka.sphere_radii)
+    # ^ matches main.py's current build_default_system/run_closed_loop, which
+    # now uses fk_batch_vectorized rather than the older fk_batch.
 
     feas_log = FeasibilityLog()
     history = {"q": [], "u_mppi": [], "u_safe": [], "h": [], "goal_error": [], "dist": [],
-               "cost_history": [], "timestep": [], "real_time": [], "conflicts": []}
+               "cost_history": [], "timestep": [], "real_time": [], "conflicts": [],
+               # --- timing instrumentation, matching main.py's schema ---------
+               "t_mppi": [], "t_cbf": [], "t_robot": [],
+               "t_gpmp2_per_cycle": [t_gpmp2_initial],  # single one-time solve -- see module docstring
+               "intervention_magnitude": []}
     # "conflicts" kept as an empty list for save_results()/CSV compatibility --
     # this architecture has no conflict-factor detection (see module docstring).
 
@@ -338,23 +422,58 @@ def run_mppi_async_hardware(mjcf_path: str, robot_ip: str = "172.16.0.2",
 
     try:
         start = time.perf_counter()
+        # Require SETTLE_TICKS consecutive readings under goal_threshold,
+        # not just the single most-recent one -- the previous single-reading
+        # check flagged "goal reached" on the first instantaneous dip below
+        # threshold, but goal_error was observed oscillating back up above
+        # it repeatedly afterward (see the fix in control_thread_fn/
+        # mppi_thread_fn above for why). This check now confirms the arm has
+        # actually settled, not just briefly passed through the target.
+        settle_ticks = 10  # ~0.5s of consecutive good readings at 20Hz
         while time.perf_counter() - start < max_duration_s and not shared.stop:
             time.sleep(0.5)
-            if history["goal_error"] and history["goal_error"][-1] < goal_threshold:
-                print(f"Goal reached (goal_error={history['goal_error'][-1]:.4f}).")
+            recent = history["goal_error"][-settle_ticks:]
+            if len(recent) >= settle_ticks and all(e < goal_threshold for e in recent):
+                print(f"Goal reached and settled (goal_error={recent[-1]:.4f}, "
+                      f"last {settle_ticks} ticks all under {goal_threshold}).")
                 break
     except KeyboardInterrupt:
         print("Interrupted -- stopping threads.")
     finally:
         shared.stop = True
+        # Stop the ROBOT as soon as the thread that actually talks to it
+        # (ctrl_thread) has exited -- do NOT wait on mppi_thread first.
+        # ctrl_thread checks shared.stop every ~control_dt (~50ms), so it
+        # should join almost immediately. mppi_thread can be mid-rollout
+        # (with the current unvectorized barrier_batch_fn, a single
+        # rollout can easily exceed a couple of seconds) and only checks
+        # shared.stop between rollouts -- but since it never touches
+        # `env`, there is no safety reason to block the hardware-stop on
+        # it. Gating env.stop() on both joins (the previous order) meant
+        # the actual stop-the-robot command could be delayed by however
+        # long MPPI's in-flight rollout took, which is the wrong
+        # priority for a safety-relevant stop.
         ctrl_thread.join(timeout=2.0)
-        mppi_thread.join(timeout=2.0)
+        if ctrl_thread.is_alive():
+            print("WARNING: control thread did not exit within 2s -- "
+                  "stopping the robot anyway.")
         try:
             env.stop()
         except Exception:
             pass
+        # mppi_thread is daemon=True and touches no hardware -- let it
+        # finish its current rollout in the background rather than
+        # blocking shutdown on it. A short join here is just to give it
+        # a chance to exit cleanly for a tidy log; it is NOT a
+        # correctness or safety requirement the way ctrl_thread's is.
+        mppi_thread.join(timeout=1.0)
+        if mppi_thread.is_alive():
+            print("Note: MPPI thread is still finishing its last rollout "
+                  "in the background (harmless -- it's a daemon thread "
+                  "and touches no hardware).")
 
     history["summary"] = _build_summary(history, d_safe, obstacle_center, q_goal, q0, goal_threshold)
+    history["summary"]["target_control_loop_hz"] = 1.0 / env.control_dt
     save_results(history)
     return history, feas_log
 
@@ -365,7 +484,40 @@ if __name__ == "__main__":
     parser.add_argument("--mjcf", type=str, default="assets/panda.xml")
     parser.add_argument("--robot-ip", type=str, default="172.16.0.2")
     parser.add_argument("--duration", type=float, default=60.0)
+
+    # --- mapped 1:1 from run_mppi_async_hardware's existing parameters ----
+    parser.add_argument("--n-mppi-samples", type=int, default=50)
+    parser.add_argument("--obstacle-center", type=float, nargs=3, default=[0.536, 0.139, 0.356],
+                         metavar=("X", "Y", "Z"), help="midpoint of home->final ee path by default")
+    parser.add_argument("--obstacle-radius", type=float, default=0.08)
+    parser.add_argument("--d-safe", type=float, default=0.10)
+    parser.add_argument("--lambda-cbf", type=float, default=1.0)
+
+    # --- N_horizon: no 1:1 equivalent -- see note below --------------------
+    # main.py's run_closed_loop re-solves GPMP2 every N_horizon steps, so
+    # N_horizon there is "how many control steps between replans". This
+    # file solves GPMP2 exactly ONCE, up front (see module docstring), so
+    # there is no per-cycle replanning to give N_horizon a step count for.
+    # The closest equivalent is gpmp2_N: how many waypoints the ONE fixed
+    # reference trajectory has. Mapped here rather than silently dropped.
+    parser.add_argument("--gpmp2-n", type=int, default=10,
+                         help="GPMP2 waypoint count for the one-time reference solve "
+                              "(closest equivalent to run_closed_loop's N_horizon -- "
+                              "see comment above this flag in the source)")
+
+    # --- n_planning_cycles, use_hardware: genuinely not applicable here -----
+    # n_planning_cycles doesn't exist in this architecture: there IS no
+    # replanning loop to count cycles of (GPMP2 solves once; see module
+    # docstring). use_hardware also isn't a real choice here -- this file
+    # has no MuJoCo/simulation path at all; build_default_system() is
+    # always called with use_hardware=True below. Neither flag is added --
+    # doing so would either be a no-op that silently does nothing, or
+    # imply a sim mode that doesn't exist in this file.
     args = parser.parse_args()
+
     history, feas_log = run_mppi_async_hardware(
-        mjcf_path=args.mjcf, robot_ip=args.robot_ip, max_duration_s=args.duration)
+        mjcf_path=args.mjcf, robot_ip=args.robot_ip, max_duration_s=args.duration,
+        n_mppi_samples=args.n_mppi_samples, obstacle_center=tuple(args.obstacle_center),
+        obstacle_radius=args.obstacle_radius, d_safe=args.d_safe,
+        lambda_cbf=args.lambda_cbf, gpmp2_N=args.gpmp2_n)
     print(history["summary"])
