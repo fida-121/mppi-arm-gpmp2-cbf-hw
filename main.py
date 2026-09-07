@@ -106,6 +106,19 @@ def _build_summary(history, d_safe, obstacle_center, q_goal, q0, success_thresho
     # NaN-safe: a NaN final_goal_error (faulted before any step) is never "success".
     success = bool(final_goal_error < success_threshold) if final_goal_error == final_goal_error else False
 
+    # --- timing summary (data-collection only) -----------------------------
+    def _mean_or_nan(lst):
+        return float(np.mean(lst)) if len(lst) > 0 else float("nan")
+
+    def _max_or_nan(lst):
+        return float(np.max(lst)) if len(lst) > 0 else float("nan")
+
+    achieved_hz = float("nan")
+    if len(history["real_time"]) > 1:
+        dt_deltas = np.diff(history["real_time"])
+        if len(dt_deltas) > 0 and np.mean(dt_deltas) > 0:
+            achieved_hz = 1.0 / float(np.mean(dt_deltas))
+
     return {
         "final_goal_error": final_goal_error,
         "min_clearance": min_clearance,
@@ -117,6 +130,17 @@ def _build_summary(history, d_safe, obstacle_center, q_goal, q0, success_thresho
         "obstacle_position": tuple(obstacle_center),
         "goal_position": q_goal.tolist(),
         "start_position": q0.tolist(),
+        # --- timing fields (Section 6 / reproducibility data) -------------
+        "t_mppi_mean_s": _mean_or_nan(history["t_mppi"]),
+        "t_mppi_max_s": _max_or_nan(history["t_mppi"]),
+        "t_cbf_mean_s": _mean_or_nan(history["t_cbf"]),
+        "t_cbf_max_s": _max_or_nan(history["t_cbf"]),
+        "t_robot_mean_s": _mean_or_nan(history["t_robot"]),
+        "t_robot_max_s": _max_or_nan(history["t_robot"]),
+        "t_gpmp2_per_cycle_mean_s": _mean_or_nan(history["t_gpmp2_per_cycle"]),
+        "t_gpmp2_per_cycle_max_s": _max_or_nan(history["t_gpmp2_per_cycle"]),
+        "achieved_control_loop_hz": achieved_hz,
+        "target_control_loop_hz": None,  # filled in by caller if desired
     }
 
 
@@ -141,7 +165,8 @@ def save_results(history, out_dir="results", tag=None):
     # time), matching fig_exp3_4_feasibility.png. Vector fields (q, u_mppi,
     # u_safe) are flattened into one column per joint so the CSV stays
     # spreadsheet/pandas-friendly. `conflict` is 1 on any timestep that
-    # appears in history["conflicts"], else 0.
+    # appears in history["conflicts"], else 0. Timing columns (t_mppi,
+    # t_cbf, t_robot) added for the multi-rate/timing analysis.
     trace_csv_path = os.path.join(out_dir, f"{stem}_trace.csv")
     n_steps = len(history["timestep"])
     dof = len(history["q"][0]) if n_steps > 0 else 0
@@ -150,7 +175,8 @@ def save_results(history, out_dir="results", tag=None):
     with open(trace_csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         header = (["timestep", "real_time", "h", "goal_error", "dist",
-                    "cost_history", "conflict"]
+                    "cost_history", "conflict", "t_mppi", "t_cbf", "t_robot",
+                    "intervention_magnitude"]
                    + [f"q_{i}" for i in range(dof)]
                    + [f"u_mppi_{i}" for i in range(dof)]
                    + [f"u_safe_{i}" for i in range(dof)])
@@ -159,7 +185,9 @@ def save_results(history, out_dir="results", tag=None):
             t = history["timestep"][idx]
             row = ([t, history["real_time"][idx], history["h"][idx],
                      history["goal_error"][idx], history["dist"][idx],
-                     history["cost_history"][idx], int(t in conflict_steps)]
+                     history["cost_history"][idx], int(t in conflict_steps),
+                     history["t_mppi"][idx], history["t_cbf"][idx],
+                     history["t_robot"][idx], history["intervention_magnitude"][idx]]
                     + list(history["q"][idx])
                     + list(history["u_mppi"][idx])
                     + list(history["u_safe"][idx]))
@@ -181,6 +209,11 @@ def save_results(history, out_dir="results", tag=None):
         goal_error=np.array(history["goal_error"]),
         dist=np.array(history["dist"]),
         conflicts=np.array(history["conflicts"]),
+        t_mppi=np.array(history["t_mppi"]),
+        t_cbf=np.array(history["t_cbf"]),
+        t_robot=np.array(history["t_robot"]),
+        t_gpmp2_per_cycle=np.array(history["t_gpmp2_per_cycle"]),
+        intervention_magnitude=np.array(history["intervention_magnitude"]),
     )
     print(f"[save_results] summary   -> {summary_path}")
     print(f"[save_results] trace csv -> {trace_csv_path}")
@@ -212,6 +245,13 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
     counted as successful in the per-run summary. Only used for logging
     the "success" field below -- does not affect control/replanning
     logic anywhere in this function.
+
+    TIMING INSTRUMENTATION (added for hardware timing analysis): each
+    control step now records t_mppi (mppi.step() wall time), t_cbf
+    (qp.solve() wall time), and t_robot (env.step() wall time), plus
+    t_gpmp2_per_cycle (planner.plan() wall time, once per outer cycle).
+    These are PURE MEASUREMENTS -- timing calls wrap existing code
+    unchanged; no control/replanning logic is affected by adding them.
     """
     def _emit(stage, **info):
         if on_stage is not None:
@@ -253,7 +293,9 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
     # (redundant-CBF) behavior if you ever want that instead.
 
     # ---- Stage 1: initial GPMP2 solve -----------------------------------
+    t_gpmp2_start = time.perf_counter()
     gpmp2_result = planner.plan(theta0, theta_goal, N=N_horizon)
+    t_gpmp2_initial = time.perf_counter() - t_gpmp2_start
     theta_star = gpmp2_result.theta_star  # (N+1, 2*dof)
     _emit("GPMP2", theta_star=theta_star, iterations=gpmp2_result.iterations,
           final_error=gpmp2_result.final_error, cycle=0)
@@ -268,7 +310,7 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
     feas_log = FeasibilityLog()
 
     mppi = MPPIController(lam=1.0, dt=dt, dof=DOF, sdf=sdf, eps_margin=0.15,
-                           sigma_obs=0.02, lambda_cbf=lambda_cbf, fk_batch_fn=franka.fk_batch,
+                           sigma_obs=0.02, lambda_cbf=lambda_cbf, fk_batch_fn=franka.fk_batch_vectorized,
                            sphere_radii=franka.sphere_radii)
     # lambda_cbf weights MPPI's own soft obstacle-avoidance cost term
     # (Step 2.2). At the default 1.0, MPPI already avoids risky rollouts
@@ -315,7 +357,11 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
                "replan_accepted": [], "replan_new_error": [], "replan_baseline_error": [],
                "rolled_back_to_best": [],
                # --- per-timestep trace additions (data-collection only) ---
-               "timestep": [], "real_time": []}
+               "timestep": [], "real_time": [],
+               # --- timing instrumentation (data-collection only) ---------
+               "t_mppi": [], "t_cbf": [], "t_robot": [],
+               "t_gpmp2_per_cycle": [t_gpmp2_initial],  # seed with the initial solve above
+               "intervention_magnitude": []}
 
     # Outcome-based checkpoint: tracks the trajectory that produced the
     # BEST real goal_err actually achieved by the robot, as opposed to
@@ -346,8 +392,10 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
             q, qdot = x[:DOF], x[DOF:]
 
             # ---- Stage 2/3: MPPI around GPMP2 prior ----------------------
+            t_mppi_start = time.perf_counter()
             mppi_result = mppi.step(theta_q_ref[k:], cov_steer.Sigma_t,
                                       n_mppi_samples, K_inv_diag[k:], barrier_batch_fn, rng)
+            t_mppi = time.perf_counter() - t_mppi_start
             _emit("MPPI", mppi_result=mppi_result, sampling_mean=theta_q_ref[k:],
                   Sigma_t=cov_steer.Sigma_t, cycle=cycle, k=k)
             u_mppi_pos = mppi_result.u_mppi[0]  # first control in the tape -- this is a
@@ -386,10 +434,13 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
                                     d_obstacle=d_obs, h0_physical=h0)
 
             # ---- Stage 5: CBF-QP -------------------------------------------
+            t_cbf_start = time.perf_counter()
             qp_result = qp.solve(u_mppi, Lf_psi1, Lg_psi1, psi1, h0_physical=h0)
+            t_cbf = time.perf_counter() - t_cbf_start
             _emit("CBF-QP", qp_result=qp_result, unsafe=unsafe, u_mppi=u_mppi, cycle=cycle, k=k)
 
             # ---- Stage 6: execute u* only -----------------------------------
+            t_robot_start = time.perf_counter()
             try:
                 env.step(qp_result.u_safe)
             except RuntimeError as e:
@@ -403,6 +454,7 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
                     history, d_safe, obstacle_center, q_goal, q0, success_threshold)
                 save_results(history, tag="FAULTED")
                 return history, feas_log, cov_steer
+            t_robot = time.perf_counter() - t_robot_start
             _emit("Robot Execution", q=q, qdot=qdot, u_safe=qp_result.u_safe,
                   ee_position=env.ee_position(), t=global_t, cycle=cycle, k=k)
 
@@ -448,6 +500,10 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
             # --- per-timestep trace additions (data-collection only) ---
             history["timestep"].append(global_t)
             history["real_time"].append(time.perf_counter() - run_start_time)
+            history["t_mppi"].append(t_mppi)
+            history["t_cbf"].append(t_cbf)
+            history["t_robot"].append(t_robot)
+            history["intervention_magnitude"].append(float(qp_result.intervention_magnitude))
             global_t += 1
 
         # ---- Per-cycle convergence diagnostic: goal error and worst-case
@@ -493,8 +549,11 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
         warm_start = np.vstack([warm_start_basis[1:], warm_start_basis[-1:]])
         history["rolled_back_to_best"].append(rolled_back)
 
+        t_gpmp2_start = time.perf_counter()
         gpmp2_result = planner.plan(theta0_cycle, theta_goal, N=N_horizon,
                                      init_trajectory=warm_start)
+        t_gpmp2 = time.perf_counter() - t_gpmp2_start
+        history["t_gpmp2_per_cycle"].append(t_gpmp2)
 
         # ---- Replan acceptance guard ----------------------------------------
         # Warm-starting (above) makes route-flipping LESS likely, but does
@@ -547,6 +606,7 @@ def run_closed_loop(mjcf_path: str, N_horizon: int = 30, dt: float = 0.05,
     # ---- Per-run summary (Table I fields) --------------------------------
     history["summary"] = _build_summary(
         history, d_safe, obstacle_center, q_goal, q0, success_threshold)
+    history["summary"]["target_control_loop_hz"] = 1.0 / dt
 
     # ---- Actually persist to disk -----------------------------------------
     # This is the step that was missing before: history lived in memory only.
